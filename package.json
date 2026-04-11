@@ -1,14 +1,14 @@
 {
 	"name": "@aialchemy/rag-sdk",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "TypeScript-first, production-oriented RAG SDK for document ingestion, OCR, chunking, embeddings, indexing, retrieval, and answer generation.",
-	"homepage": "https://github.com/aialchemy/rag-sdk#readme",
+	"homepage": "https://github.com/aialchemylabs/rag-sdk#readme",
 	"bugs": {
-		"url": "https://github.com/aialchemy/rag-sdk/issues"
+		"url": "https://github.com/aialchemylabs/rag-sdk/issues"
 	},
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/aialchemy/rag-sdk.git"
+		"url": "git+https://github.com/aialchemylabs/rag-sdk.git"
 	},
 	"license": "MIT",
 	"author": "AI Alchemy Labs",
