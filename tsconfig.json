@@ -2,7 +2,9 @@
 	"compilerOptions": {
 		"ignoreDeprecations": "6.0",
 		"target": "ES2022",
-		"lib": ["ES2022"],
+		"lib": [
+			"ES2022"
+		],
 		"module": "ESNext",
 		"moduleResolution": "bundler",
 		"allowSyntheticDefaultImports": true,
@@ -25,6 +27,14 @@
 		"noUnusedParameters": true,
 		"skipLibCheck": true
 	},
-	"include": ["src/**/*.ts"],
-	"exclude": ["node_modules", "dist", "references", "examples", "src/**/*.test.ts"]
+	"include": [
+		"src/**/*.ts"
+	],
+	"exclude": [
+		"node_modules",
+		"dist",
+		"references",
+		"examples",
+		"src/**/*.test.ts"
+	]
 }

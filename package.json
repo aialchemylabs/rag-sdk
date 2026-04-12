@@ -42,7 +42,9 @@
 		"lint:fix": "biome check --write src/",
 		"format": "biome format --write .",
 		"test": "vitest run",
+		"test:e2e": "vitest run --config vitest.e2e.config.ts",
 		"test:watch": "vitest",
+		"typecheck:e2e": "tsc --noEmit -p e2e/tsconfig.json",
 		"prepublishOnly": "pnpm run build && pnpm run typecheck && pnpm run typecheck:examples"
 	},
 	"dependencies": {
