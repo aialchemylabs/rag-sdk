@@ -79,6 +79,7 @@ describe('createOpenAIProvider', () => {
 			expect(mockEmbeddingsCreate).toHaveBeenCalledWith({
 				model: 'text-embedding-3-small',
 				input: ['hello', 'world'],
+				encoding_format: 'float',
 			});
 		});
 
@@ -96,6 +97,7 @@ describe('createOpenAIProvider', () => {
 			expect(mockEmbeddingsCreate).toHaveBeenCalledWith({
 				model: 'text-embedding-3-small',
 				input: ['hello'],
+				encoding_format: 'float',
 			});
 		});
 

@@ -1,6 +1,7 @@
 import type { CitationAnchor } from './citation.types.js';
 import type { ChunkMetadata } from '../chunking/chunk.types.js';
 import type { SecurityContext } from '../config/security.types.js';
+import type { TelemetryEvent } from '../telemetry/telemetry.types.js';
 
 /** Options for vector similarity retrieval. */
 export interface RetrieveOptions {
@@ -14,6 +15,14 @@ export interface RetrieveOptions {
 	};
 	security?: SecurityContext;
 	includeMetadata?: boolean;
+	/**
+	 * Optional per-call telemetry override. See `IngestOptions.telemetry` for
+	 * behavior — runs in addition to the client-scoped handler; errors are
+	 * swallowed and logged.
+	 */
+	telemetry?: {
+		onEvent?: (event: TelemetryEvent) => void | Promise<void>;
+	};
 }
 
 /** Extended options for hybrid (dense + sparse) retrieval. */

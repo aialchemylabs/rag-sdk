@@ -32,21 +32,41 @@ export class AnswerService {
 		}
 
 		const noCitationPolicy = options?.noCitationPolicy ?? answeringConfig.noCitationPolicy;
+		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
+		const tenantId = options?.security?.tenantId;
+
+		telemetry.emit('answer_generation_started', {
+			tenantId,
+			metadata: { query: query.substring(0, 100), noCitationPolicy },
+		});
 
 		try {
-			// Step 1: Retrieve relevant chunks
+			// Step 1: Retrieve relevant chunks — propagate per-call telemetry so
+			// retrieval events are delivered to the same handler as the answer events.
 			const retrieveStartTime = Date.now();
 			const retrievalResult = await this.retriever.query(query, {
 				topK: options?.topK,
 				scoreThreshold: options?.scoreThreshold,
 				filters: options?.filters,
 				security: options?.security,
+				telemetry: options?.telemetry,
 			});
 			const retrievalTimeMs = Date.now() - retrieveStartTime;
 
 			// Step 2: Check if we have sufficient evidence
 			if (retrievalResult.matches.length === 0) {
-				return this.handleNoEvidence(query, noCitationPolicy, retrievalTimeMs, startTime);
+				const noEvidenceResult = this.handleNoEvidence(query, noCitationPolicy, retrievalTimeMs, startTime);
+				telemetry.emit('answer_generation_executed', {
+					durationMs: noEvidenceResult.totalTimeMs,
+					tenantId,
+					metadata: {
+						query: query.substring(0, 100),
+						matchCount: 0,
+						riskLevel: noEvidenceResult.riskLevel,
+						outcome: 'no_evidence',
+					},
+				});
+				return noEvidenceResult;
 			}
 
 			// Step 3: Build context and generate answer
@@ -103,13 +123,25 @@ export class AnswerService {
 
 			const { validReferencedIndices, invalidReferencedIndices } = citationValidation;
 			if (invalidReferencedIndices.size > 0 || validReferencedIndices.size === 0) {
-				return this.handleCitationContractViolation(
+				const violationResult = this.handleCitationContractViolation(
 					noCitationPolicy,
 					retrievalTimeMs,
 					generationTimeMs,
 					startTime,
 					invalidReferencedIndices,
 				);
+				telemetry.emit('answer_generation_executed', {
+					durationMs: violationResult.totalTimeMs,
+					tenantId,
+					metadata: {
+						query: query.substring(0, 100),
+						matchCount: retrievalResult.matches.length,
+						riskLevel: violationResult.riskLevel,
+						outcome: 'citation_violation',
+						invalidMarkers: [...invalidReferencedIndices],
+					},
+				});
+				return violationResult;
 			}
 
 			const citations = allCitations.filter((c) => validReferencedIndices.has(c.citationIndex));
@@ -123,8 +155,9 @@ export class AnswerService {
 
 			const totalTimeMs = Date.now() - startTime;
 
-			this.telemetry.emit('answer_generation_executed', {
+			telemetry.emit('answer_generation_executed', {
 				durationMs: totalTimeMs,
+				tenantId,
 				metadata: {
 					query: query.substring(0, 100),
 					matchCount: retrievalResult.matches.length,
@@ -152,6 +185,12 @@ export class AnswerService {
 				totalTimeMs,
 			};
 		} catch (err) {
+			telemetry.emit('answer_generation_failed', {
+				durationMs: Date.now() - startTime,
+				tenantId,
+				error: err instanceof Error ? err.message : String(err),
+				metadata: { query: query.substring(0, 100) },
+			});
 			if (err instanceof RagSdkError) throw err;
 			throw new RagSdkError(
 				RagErrorCode.ANSWER_PROVIDER_ERROR,

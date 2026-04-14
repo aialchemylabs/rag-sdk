@@ -27,6 +27,12 @@ export class RetrieveService {
 			);
 		}
 
+		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
+		telemetry.emit('retrieval_started', {
+			tenantId,
+			metadata: { query: query.substring(0, 100), searchType: 'dense', topK },
+		});
+
 		try {
 			const [queryEmbedding] = await this.embeddings.embedTexts([query]);
 
@@ -45,7 +51,7 @@ export class RetrieveService {
 
 			const searchTimeMs = Date.now() - startTime;
 
-			this.telemetry.emit('retrieval_executed', {
+			telemetry.emit('retrieval_executed', {
 				durationMs: searchTimeMs,
 				tenantId,
 				metadata: { query: query.substring(0, 100), matchCount: matches.length, searchType: 'dense' },
@@ -59,6 +65,12 @@ export class RetrieveService {
 				searchType: 'dense',
 			};
 		} catch (err) {
+			telemetry.emit('retrieval_failed', {
+				durationMs: Date.now() - startTime,
+				tenantId,
+				error: err instanceof Error ? err.message : String(err),
+				metadata: { query: query.substring(0, 100), searchType: 'dense' },
+			});
 			if (err instanceof RagSdkError) throw err;
 			throw new RagSdkError(
 				RagErrorCode.VECTOR_SEARCH_FAILED,
@@ -89,6 +101,12 @@ export class RetrieveService {
 			);
 		}
 
+		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
+		telemetry.emit('retrieval_started', {
+			tenantId,
+			metadata: { query: query.substring(0, 100), searchType: 'hybrid', topK, fusionAlpha },
+		});
+
 		try {
 			const [queryEmbedding] = await this.embeddings.embedTexts([query]);
 
@@ -108,7 +126,7 @@ export class RetrieveService {
 
 			const searchTimeMs = Date.now() - startTime;
 
-			this.telemetry.emit('retrieval_executed', {
+			telemetry.emit('retrieval_executed', {
 				durationMs: searchTimeMs,
 				tenantId,
 				metadata: { query: query.substring(0, 100), matchCount: matches.length, searchType: 'hybrid' },
@@ -122,6 +140,12 @@ export class RetrieveService {
 				searchType: 'hybrid',
 			};
 		} catch (err) {
+			telemetry.emit('retrieval_failed', {
+				durationMs: Date.now() - startTime,
+				tenantId,
+				error: err instanceof Error ? err.message : String(err),
+				metadata: { query: query.substring(0, 100), searchType: 'hybrid' },
+			});
 			if (err instanceof RagSdkError) throw err;
 			throw new RagSdkError(
 				RagErrorCode.VECTOR_SEARCH_FAILED,

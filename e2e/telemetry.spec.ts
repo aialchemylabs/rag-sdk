@@ -37,9 +37,53 @@ describe('Telemetry Events', () => {
 
 		const eventTypes = events.map((e) => e.type);
 		expect(eventTypes).toContain('ingestion_started');
+		expect(eventTypes).toContain('chunking_started');
+		expect(eventTypes).toContain('chunking_completed');
+		expect(eventTypes).toContain('embeddings_started');
 		expect(eventTypes).toContain('embeddings_completed');
+		expect(eventTypes).toContain('qdrant_upsert_started');
 		expect(eventTypes).toContain('qdrant_upsert_completed');
 		expect(eventTypes).toContain('ingestion_completed');
+	});
+
+	it('delivers events to a per-call telemetry override in addition to the client-scoped handler', async () => {
+		const clientEvents: string[] = [];
+		const perCallEvents: string[] = [];
+
+		const rag = await createRag(
+			baseConfig({
+				qdrant: { url: 'http://localhost:6333', collection: 'test-telemetry-override' },
+				telemetry: {
+					enabled: true,
+					onEvent: (event: unknown) => {
+						clientEvents.push((event as { type: string }).type);
+					},
+				},
+			}),
+		);
+
+		await rag.ingest.text(SAMPLE_TEXT, {
+			telemetry: {
+				onEvent: (event) => {
+					perCallEvents.push(event.type);
+				},
+			},
+		});
+
+		expect(perCallEvents).toContain('ingestion_started');
+		expect(perCallEvents).toContain('ingestion_completed');
+		expect(clientEvents).toContain('ingestion_started');
+		expect(clientEvents).toContain('ingestion_completed');
+	});
+
+	it('uses a caller-supplied documentId when provided via options', async () => {
+		const rag = await createRag(
+			baseConfig({ qdrant: { url: 'http://localhost:6333', collection: 'test-telemetry-docid' } }),
+		);
+
+		const result = await rag.ingest.text(SAMPLE_TEXT, { documentId: 'platform-uuid-42' });
+
+		expect(result.documentId).toBe('platform-uuid-42');
 	});
 
 	it('emits OCR events during buffer ingestion', async () => {

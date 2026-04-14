@@ -94,6 +94,9 @@ function makeMocks() {
 		emit: vi.fn(),
 		metric: vi.fn(),
 		trackDuration: vi.fn(),
+		withOverride: vi.fn(function (this: unknown) {
+			return this as TelemetryEmitter;
+		}),
 	} as unknown as TelemetryEmitter;
 
 	return { embeddings, vector, telemetry };

@@ -26,7 +26,7 @@ describe('Initialization & Config Validation', () => {
 
 	it('version() returns the SDK version', async () => {
 		const rag = await createRag(baseConfig());
-		expect(rag.version()).toBe('0.1.1');
+		expect(rag.version()).toBe('0.1.2');
 	});
 
 	it('validateConfig() returns valid for a good config', async () => {

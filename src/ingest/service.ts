@@ -6,13 +6,17 @@ import { RagSdkError } from '../errors/ragError.js';
 import type { JobManager } from '../jobs/jobManager.js';
 import type { OcrAdapter } from '../ocr/mistralAdapter.js';
 import type { TelemetryEmitter } from '../telemetry/emitter.js';
+import { createLogger } from '../telemetry/logger.js';
 import type { NormalizedDocument } from '../normalize/document.types.js';
 import type { IngestInput, IngestOptions, IngestResult } from './ingest.types.js';
 import { generateId } from '../utils/id.js';
 import type { QdrantAdapter } from '../vector/qdrantAdapter.js';
+import type { Chunk, ChunkingResult } from '../chunking/chunk.types.js';
 import { chunkDocument } from '../chunking/chunker.js';
 import { normalizeOcrResult } from '../normalize/normalizer.js';
 import { detectInputType, validateFileSize } from './inputAdapter.js';
+
+const logger = createLogger('ingest:service');
 
 export class IngestService {
 	constructor(
@@ -75,14 +79,30 @@ export class IngestService {
 		existingDocumentId?: string,
 	): Promise<IngestResult> {
 		const startTime = Date.now();
-		const documentId = existingDocumentId ?? generateId('doc');
+		const providedDocumentId = options?.documentId;
+		if (providedDocumentId !== undefined) {
+			this.validateExternalDocumentId(providedDocumentId);
+		}
+		const documentId = providedDocumentId ?? existingDocumentId ?? generateId('doc');
+		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
 		const warnings: string[] = [];
 
-		this.telemetry.emit('ingestion_started', { documentId, metadata: { fileName, mimeType } });
+		telemetry.emit('ingestion_started', {
+			documentId,
+			tenantId,
+			metadata: { fileName, mimeType, externalDocumentId: providedDocumentId !== undefined },
+		});
 
 		try {
 			// Step 1: OCR / Extract
-			const normalizedDocument = await this.extractDocument(input, fileName, mimeType, documentId, processingMode);
+			const normalizedDocument = await this.extractDocument(
+				input,
+				fileName,
+				mimeType,
+				documentId,
+				processingMode,
+				telemetry,
+			);
 
 			if (normalizedDocument.warnings.length > 0) {
 				for (const w of normalizedDocument.warnings) {
@@ -105,35 +125,128 @@ export class IngestService {
 			}
 
 			// Step 3: Chunk
-			const chunkingResult = chunkDocument(normalizedDocument, this.config.chunking, {
-				embeddingVersion: this.embeddings.getVersionLabel(),
-				processingMode,
-				tenantId,
-				domainId,
-				tags,
-				mimeType,
-				customMetadata: options?.metadata,
-			});
+			const chunkingStart = Date.now();
+			telemetry.emit('chunking_started', { documentId, tenantId });
+			let chunkingResult: ChunkingResult;
+			try {
+				chunkingResult = chunkDocument(normalizedDocument, this.config.chunking, {
+					embeddingVersion: this.embeddings.getVersionLabel(),
+					processingMode,
+					tenantId,
+					domainId,
+					tags,
+					mimeType,
+					customMetadata: options?.metadata,
+				});
+				telemetry.emit('chunking_completed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - chunkingStart,
+					metadata: {
+						chunkCount: chunkingResult.chunks.length,
+						totalTokens: chunkingResult.totalTokens,
+					},
+				});
+			} catch (err) {
+				telemetry.emit('chunking_failed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - chunkingStart,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				throw err;
+			}
 
 			// Step 4: Embed
-			const embeddedChunks = await this.embeddings.embedChunks(chunkingResult.chunks);
-			this.telemetry.emit('embeddings_completed', {
+			const embeddingsStart = Date.now();
+			telemetry.emit('embeddings_started', {
 				documentId,
-				metadata: { chunkCount: embeddedChunks.length },
+				tenantId,
+				metadata: { chunkCount: chunkingResult.chunks.length },
 			});
+			let embeddedChunks: Chunk[];
+			try {
+				embeddedChunks = await this.embeddings.embedChunks(chunkingResult.chunks);
+				telemetry.emit('embeddings_completed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - embeddingsStart,
+					metadata: {
+						chunkCount: embeddedChunks.length,
+						dimensions: embeddedChunks[0]?.embedding?.length,
+					},
+				});
+			} catch (err) {
+				telemetry.emit('embeddings_failed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - embeddingsStart,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				throw err;
+			}
+
+			// Step 4b: Validate embedding dimensions against configured vectorSize.
+			// When vectorSize is explicitly configured, a mismatch indicates either a
+			// provider misconfiguration or a silently-corrupted response (e.g. the
+			// OpenAI v6 base64/float decoding bug against LiteLLM backends). Fail loud
+			// BEFORE seeding Qdrant with garbage vectors.
+			const configuredVectorSize = this.config.embeddings.vectorSize;
+			const actualDimensions = embeddedChunks[0]?.embedding?.length;
+			if (configuredVectorSize != null && actualDimensions != null && actualDimensions !== configuredVectorSize) {
+				throw new RagSdkError(
+					RagErrorCode.EMBEDDING_PROVIDER_ERROR,
+					`Embedding dimension mismatch: embeddings.vectorSize is configured as ${configuredVectorSize} but the provider returned vectors of length ${actualDimensions}. ` +
+						'This usually indicates a provider misconfiguration or a corrupted response from the embedding backend. ' +
+						`Verify the model, base URL, and encoding_format settings for provider '${this.config.embeddings.provider}'.`,
+					{
+						provider: this.config.embeddings.provider,
+						retryable: false,
+					},
+				);
+			}
+			if (configuredVectorSize == null && actualDimensions != null) {
+				// Fallback path — dimensions inferred from the first embedding. This is
+				// how the SDK used to seed collections. It hides provider corruption, so
+				// we log a warning advising callers to set embeddings.vectorSize.
+				logger.warn(
+					'embeddings.vectorSize is not configured — collection dimension will be inferred from the first embedding. Set embeddings.vectorSize to catch provider corruption early.',
+					{ inferredDimensions: actualDimensions },
+				);
+			}
 
 			// Step 5: Ensure collection and upsert
-			await this.vector.ensureCollection(
-				tenantId,
-				this.config.embeddings.vectorSize ?? embeddedChunks[0]?.embedding?.length ?? 1536,
-				this.config.embeddings.distanceMetric,
-			);
-
-			const { upserted } = await this.vector.upsertChunks(embeddedChunks, tenantId);
-			this.telemetry.emit('qdrant_upsert_completed', {
+			const upsertStart = Date.now();
+			telemetry.emit('qdrant_upsert_started', {
 				documentId,
-				metadata: { upserted },
+				tenantId,
+				metadata: { chunkCount: embeddedChunks.length },
 			});
+			let upserted: number;
+			try {
+				await this.vector.ensureCollection(
+					tenantId,
+					configuredVectorSize ?? actualDimensions ?? 1536,
+					this.config.embeddings.distanceMetric,
+				);
+
+				const upsertResult = await this.vector.upsertChunks(embeddedChunks, tenantId);
+				upserted = upsertResult.upserted;
+				telemetry.emit('qdrant_upsert_completed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - upsertStart,
+					metadata: { upserted },
+				});
+			} catch (err) {
+				telemetry.emit('qdrant_upsert_failed', {
+					documentId,
+					tenantId,
+					durationMs: Date.now() - upsertStart,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				throw err;
+			}
 
 			// Persist document record in the document store
 			if (this.documentStore) {
@@ -158,8 +271,9 @@ export class IngestService {
 
 			const processingTimeMs = Date.now() - startTime;
 
-			this.telemetry.emit('ingestion_completed', {
+			telemetry.emit('ingestion_completed', {
 				documentId,
+				tenantId,
 				durationMs: processingTimeMs,
 				metadata: { chunksIndexed: upserted, fileName },
 			});
@@ -175,11 +289,28 @@ export class IngestService {
 				warnings,
 			};
 		} catch (err) {
-			this.telemetry.emit('ingestion_failed', {
+			telemetry.emit('ingestion_failed', {
 				documentId,
+				tenantId,
+				durationMs: Date.now() - startTime,
 				error: err instanceof Error ? err.message : String(err),
 			});
 			throw err;
+		}
+	}
+
+	private validateExternalDocumentId(documentId: string): void {
+		if (typeof documentId !== 'string' || documentId.length === 0) {
+			throw new RagSdkError(
+				RagErrorCode.VALIDATION_INVALID_INPUT,
+				'options.documentId must be a non-empty string when provided.',
+			);
+		}
+		if (documentId.length > 256) {
+			throw new RagSdkError(
+				RagErrorCode.VALIDATION_INVALID_INPUT,
+				`options.documentId must be at most 256 characters (got ${documentId.length}).`,
+			);
 		}
 	}
 
@@ -193,7 +324,10 @@ export class IngestService {
 		processingMode: string,
 		options?: IngestOptions,
 	): Promise<IngestResult> {
-		const documentId = generateId('doc');
+		if (options?.documentId !== undefined) {
+			this.validateExternalDocumentId(options.documentId);
+		}
+		const documentId = options?.documentId ?? generateId('doc');
 
 		const manager = this.jobManager as JobManager;
 		const job = await manager.createJob(documentId, fileName, tenantId, async (_job, signal) => {
@@ -230,6 +364,7 @@ export class IngestService {
 		mimeType: string,
 		documentId: string,
 		processingMode: string,
+		telemetry: TelemetryEmitter,
 	): Promise<NormalizedDocument> {
 		if (input.type === 'text') {
 			return this.createTextDocument(input.text, fileName, documentId);
@@ -243,6 +378,10 @@ export class IngestService {
 		// hybrid: Mistral OCR combines both strategies automatically.
 
 		const ocrStartTime = Date.now();
+		telemetry.emit('ocr_started', {
+			documentId,
+			metadata: { fileName, processingMode },
+		});
 		try {
 			let rawResult: Awaited<ReturnType<typeof this.ocr.processFile>>;
 
@@ -259,7 +398,7 @@ export class IngestService {
 			}
 
 			const ocrDurationMs = Date.now() - ocrStartTime;
-			this.telemetry.emit('ocr_completed', {
+			telemetry.emit('ocr_completed', {
 				documentId,
 				durationMs: ocrDurationMs,
 				metadata: { fileName, pageCount: rawResult.pages.length, processingMode },
@@ -290,8 +429,9 @@ export class IngestService {
 
 			return normalized;
 		} catch (err) {
-			this.telemetry.emit('ocr_failed', {
+			telemetry.emit('ocr_failed', {
 				documentId,
+				durationMs: Date.now() - ocrStartTime,
 				error: err instanceof Error ? err.message : String(err),
 			});
 

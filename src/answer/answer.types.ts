@@ -1,5 +1,6 @@
 import type { Citation } from '../retrieve/citation.types.js';
 import type { SecurityContext } from '../config/security.types.js';
+import type { TelemetryEvent } from '../telemetry/telemetry.types.js';
 
 /** Options for RAG answer generation. */
 export interface AnswerOptions {
@@ -14,6 +15,14 @@ export interface AnswerOptions {
 	maxTokens?: number;
 	temperature?: number;
 	noCitationPolicy?: 'warn' | 'refuse' | 'allow';
+	/**
+	 * Optional per-call telemetry override. See `IngestOptions.telemetry` for
+	 * behavior — runs in addition to the client-scoped handler; errors are
+	 * swallowed and logged.
+	 */
+	telemetry?: {
+		onEvent?: (event: TelemetryEvent) => void | Promise<void>;
+	};
 }
 
 /** A citation anchoring a claim in the generated answer to source text. */

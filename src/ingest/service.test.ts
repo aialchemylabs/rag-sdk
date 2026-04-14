@@ -153,6 +153,9 @@ function makeMocks() {
 		emit: vi.fn(),
 		metric: vi.fn(),
 		trackDuration: vi.fn(),
+		withOverride: vi.fn(function (this: unknown) {
+			return this as TelemetryEmitter;
+		}),
 	} as unknown as TelemetryEmitter;
 
 	const jobManager = {
@@ -290,6 +293,196 @@ describe('IngestService', () => {
 			const eventNames = emitCalls.map((c: unknown[]) => c[0]);
 			expect(eventNames).toContain('ingestion_started');
 			expect(eventNames).toContain('ingestion_completed');
+		});
+
+		it('emits per-stage _started and _completed events for chunking, embeddings, and qdrant_upsert', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await service.text('Hello world content');
+
+			const eventNames = (mocks.telemetry.emit as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[0]);
+			expect(eventNames).toEqual(
+				expect.arrayContaining([
+					'ingestion_started',
+					'chunking_started',
+					'chunking_completed',
+					'embeddings_started',
+					'embeddings_completed',
+					'qdrant_upsert_started',
+					'qdrant_upsert_completed',
+					'ingestion_completed',
+				]),
+			);
+		});
+
+		it('emits embeddings_failed and terminal ingestion_failed when embedChunks throws', async () => {
+			const mocks = makeMocks();
+			(mocks.embeddings.embedChunks as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('embed boom'));
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await expect(service.text('Hello')).rejects.toThrow('embed boom');
+
+			const emitCalls = (mocks.telemetry.emit as ReturnType<typeof vi.fn>).mock.calls;
+			const eventNames = emitCalls.map((c: unknown[]) => c[0]);
+			expect(eventNames).toContain('embeddings_started');
+			expect(eventNames).toContain('embeddings_failed');
+			expect(eventNames).toContain('ingestion_failed');
+			expect(eventNames).not.toContain('embeddings_completed');
+
+			const embeddingsFailedCall = emitCalls.find((c) => c[0] === 'embeddings_failed');
+			expect((embeddingsFailedCall?.[1] as { error?: string })?.error).toBe('embed boom');
+		});
+
+		it('emits qdrant_upsert_failed when the upsert step throws', async () => {
+			const mocks = makeMocks();
+			(mocks.vector.upsertChunks as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('qdrant boom'));
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await expect(service.text('Hello')).rejects.toThrow('qdrant boom');
+
+			const eventNames = (mocks.telemetry.emit as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[0]);
+			expect(eventNames).toContain('qdrant_upsert_started');
+			expect(eventNames).toContain('qdrant_upsert_failed');
+			expect(eventNames).toContain('ingestion_failed');
+			expect(eventNames).not.toContain('qdrant_upsert_completed');
+		});
+
+		it('routes events to a per-call telemetry override in addition to the client handler', async () => {
+			const mocks = makeMocks();
+			const overrideEvents: string[] = [];
+			(mocks.telemetry.withOverride as ReturnType<typeof vi.fn>).mockImplementationOnce(
+				(handler: (event: { type: string }) => void) => ({
+					emit: vi.fn((type: string, data: unknown) => {
+						handler({ type });
+						(mocks.telemetry.emit as ReturnType<typeof vi.fn>)(type, data);
+					}),
+					metric: vi.fn(),
+					trackDuration: vi.fn(),
+					withOverride: vi.fn(),
+				}),
+			);
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await service.text('Hello', {
+				telemetry: {
+					onEvent: (event) => {
+						overrideEvents.push(event.type);
+					},
+				},
+			});
+
+			expect(overrideEvents).toContain('ingestion_started');
+			expect(overrideEvents).toContain('ingestion_completed');
+		});
+	});
+
+	describe('external documentId', () => {
+		it('uses options.documentId when provided instead of generating one', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(
+				makeConfig(),
+				mocks.ocr,
+				mocks.embeddings,
+				mocks.vector,
+				mocks.telemetry,
+				undefined,
+				mocks.documentStore,
+			);
+
+			const result = await service.text('Hello', { documentId: 'platform-uuid-123' });
+
+			expect(result.documentId).toBe('platform-uuid-123');
+			expect(mocks.documentStore.put).toHaveBeenCalledWith(
+				expect.objectContaining({ documentId: 'platform-uuid-123' }),
+			);
+		});
+
+		it('rejects empty string documentId', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await expect(service.text('Hello', { documentId: '' })).rejects.toThrow('non-empty');
+		});
+
+		it('rejects documentId over 256 chars', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await expect(service.text('Hello', { documentId: 'x'.repeat(257) })).rejects.toThrow('256 characters');
+		});
+
+		it('threads options.documentId into async jobs', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(
+				makeConfig(),
+				mocks.ocr,
+				mocks.embeddings,
+				mocks.vector,
+				mocks.telemetry,
+				mocks.jobManager,
+			);
+
+			const result = await service.text('Hello', { async: true, documentId: 'platform-uuid-async' });
+
+			expect(result.documentId).toBe('platform-uuid-async');
+			expect(mocks.jobManager.createJob).toHaveBeenCalledWith(
+				'platform-uuid-async',
+				expect.any(String),
+				expect.any(String),
+				expect.any(Function),
+			);
+		});
+	});
+
+	describe('embedding dimension validation', () => {
+		it('throws a clear error when configured vectorSize does not match provider output', async () => {
+			const mocks = makeMocks();
+			// Mocked embedChunks returns length-3 embeddings; configure vectorSize as 1024 to force mismatch
+			const service = new IngestService(
+				makeConfig({
+					embeddings: {
+						provider: 'openai',
+						model: 'text-embedding-3-small',
+						apiKey: 'test-key',
+						distanceMetric: 'cosine',
+						versionLabel: 'openai:text-embedding-3-small',
+						vectorSize: 1024,
+					},
+				}),
+				mocks.ocr,
+				mocks.embeddings,
+				mocks.vector,
+				mocks.telemetry,
+			);
+
+			await expect(service.text('Hello')).rejects.toThrow(/Embedding dimension mismatch.*1024.*3/);
+			// Must not reach the upsert stage
+			expect(mocks.vector.upsertChunks).not.toHaveBeenCalled();
+		});
+
+		it('allows ingestion when configured vectorSize matches provider output', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(
+				makeConfig({
+					embeddings: {
+						provider: 'openai',
+						model: 'text-embedding-3-small',
+						apiKey: 'test-key',
+						distanceMetric: 'cosine',
+						versionLabel: 'openai:text-embedding-3-small',
+						vectorSize: 3,
+					},
+				}),
+				mocks.ocr,
+				mocks.embeddings,
+				mocks.vector,
+				mocks.telemetry,
+			);
+
+			const result = await service.text('Hello');
+			expect(result.status).toBe('completed');
+			expect(mocks.vector.upsertChunks).toHaveBeenCalled();
 		});
 	});
 });

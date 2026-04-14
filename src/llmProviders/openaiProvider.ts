@@ -60,9 +60,14 @@ export function createOpenAIProvider(config: LLMProviderConfig): LLMProvider {
 			logger.debug('Generating embeddings', { model: config.model, count: texts.length });
 
 			try {
+				// encoding_format must be explicitly 'float'. OpenAI npm v6 flipped the default
+				// to 'base64', which the client decodes assuming an OpenAI server response.
+				// LiteLLM-mediated providers (Ollama, Cohere, Voyage, etc.) return plain JSON
+				// float arrays, and the v6 decoder misreads those as base64 → 256 garbage floats.
 				const response = await client.embeddings.create({
 					model: config.model,
 					input: texts,
+					encoding_format: 'float',
 				});
 
 				const embeddings = response.data.sort((a, b) => a.index - b.index).map((item) => item.embedding);

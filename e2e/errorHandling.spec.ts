@@ -114,6 +114,6 @@ describe('Healthcheck', () => {
 		expect(health.status).toBe('ok');
 		expect(health.details.qdrant).toBe('connected');
 		expect(health.details.embeddingProvider).toBe('openai');
-		expect(health.details.version).toBe('0.1.1');
+		expect(health.details.version).toBe('0.1.2');
 	});
 });
