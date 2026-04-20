@@ -5,6 +5,7 @@ import type { ChatProvider } from '../llmProviders/llmProvider.types.js';
 import type { RetrieveService } from '../retrieve/service.js';
 import type { TelemetryEmitter } from '../telemetry/emitter.js';
 import type { AnswerCitation, AnswerOptions, AnswerResult } from './answer.types.js';
+import { buildCitationExcerpt } from './excerpt.js';
 import type { RetrieveMatch } from '../retrieve/retrieve.types.js';
 
 interface CitationValidation {
@@ -33,7 +34,7 @@ export class AnswerService {
 
 		const noCitationPolicy = options?.noCitationPolicy ?? answeringConfig.noCitationPolicy;
 		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
-		const tenantId = options?.security?.tenantId;
+		const tenantId = options?.security?.tenantId ?? this.config.defaults.tenantId;
 
 		telemetry.emit('answer_generation_started', {
 			tenantId,
@@ -372,7 +373,7 @@ Rules:
 			anchor: match.citation,
 			relevanceScore: match.score,
 			citationIndex: index + 1,
-			text: match.content.substring(0, 300),
+			text: buildCitationExcerpt(match.content, 300),
 		}));
 	}
 

@@ -157,55 +157,74 @@ export class QdrantAdapter {
 
 	async upsertChunks(chunks: Chunk[], tenantId: string): Promise<{ upserted: number }> {
 		const name = this.collectionName(tenantId);
-		let totalUpserted = 0;
 
-		try {
-			for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-				const batch = chunks.slice(i, i + BATCH_SIZE);
-				const points = batch.map((chunk) => {
-					if (!chunk.embedding?.length) {
-						throw new RagSdkError(RagErrorCode.VECTOR_UPSERT_FAILED, `Chunk "${chunk.chunkId}" has no embedding`, {
-							provider: 'qdrant',
-							details: { documentId: chunk.documentId },
-						});
-					}
-
-					const sparse = encodeSparse(chunk.content);
-					return {
-						id: toUuid(chunk.chunkId),
-						vector: {
-							'': chunk.embedding,
-							text: { indices: sparse.indices, values: sparse.values },
-						},
-						payload: {
-							documentId: chunk.documentId,
-							chunkId: chunk.chunkId,
-							chunkIndex: chunk.metadata.chunkIndex,
-							sourceName: chunk.metadata.sourceName,
-							content: chunk.content,
-							pageStart: chunk.metadata.pageStart,
-							pageEnd: chunk.metadata.pageEnd,
-							...(chunk.metadata.sectionTitle !== undefined && { sectionTitle: chunk.metadata.sectionTitle }),
-							...(chunk.metadata.tenantId !== undefined && { tenantId: chunk.metadata.tenantId }),
-							...(chunk.metadata.domainId !== undefined && { domainId: chunk.metadata.domainId }),
-							...(chunk.metadata.tags?.length && { tags: chunk.metadata.tags }),
-							...(chunk.metadata.mimeType !== undefined && { mimeType: chunk.metadata.mimeType }),
-							...(chunk.metadata.customMetadata !== undefined && { metadata: chunk.metadata.customMetadata }),
-							processingMode: chunk.metadata.processingMode,
-							embeddingVersion: chunk.metadata.embeddingVersion,
-							ocrProvider: chunk.metadata.ocrProvider,
-							createdAt: chunk.metadata.createdAt,
-						} as Record<string, unknown>,
-					};
+		const allPoints = chunks.map((chunk) => {
+			if (!chunk.embedding?.length) {
+				throw new RagSdkError(RagErrorCode.VECTOR_UPSERT_FAILED, `Chunk "${chunk.chunkId}" has no embedding`, {
+					provider: 'qdrant',
+					details: { documentId: chunk.documentId },
 				});
-
-				await this.client.upsert(name, { wait: true, points });
-				totalUpserted += points.length;
 			}
 
-			logger.info('Upserted chunks', { collection: name, count: totalUpserted });
-			return { upserted: totalUpserted };
+			const sparse = encodeSparse(chunk.content);
+			return {
+				id: toUuid(chunk.chunkId),
+				vector: {
+					'': chunk.embedding,
+					text: { indices: sparse.indices, values: sparse.values },
+				},
+				payload: {
+					documentId: chunk.documentId,
+					chunkId: chunk.chunkId,
+					chunkIndex: chunk.metadata.chunkIndex,
+					sourceName: chunk.metadata.sourceName,
+					content: chunk.content,
+					pageStart: chunk.metadata.pageStart,
+					pageEnd: chunk.metadata.pageEnd,
+					...(chunk.metadata.sectionTitle !== undefined && { sectionTitle: chunk.metadata.sectionTitle }),
+					...(chunk.metadata.tenantId !== undefined && { tenantId: chunk.metadata.tenantId }),
+					...(chunk.metadata.domainId !== undefined && { domainId: chunk.metadata.domainId }),
+					...(chunk.metadata.tags?.length && { tags: chunk.metadata.tags }),
+					...(chunk.metadata.mimeType !== undefined && { mimeType: chunk.metadata.mimeType }),
+					...(chunk.metadata.customMetadata !== undefined && { metadata: chunk.metadata.customMetadata }),
+					processingMode: chunk.metadata.processingMode,
+					embeddingVersion: chunk.metadata.embeddingVersion,
+					ocrProvider: chunk.metadata.ocrProvider,
+					createdAt: chunk.metadata.createdAt,
+				} as Record<string, unknown>,
+			};
+		});
+
+		const insertedIds: (string | number)[] = [];
+
+		try {
+			for (let i = 0; i < allPoints.length; i += BATCH_SIZE) {
+				const batch = allPoints.slice(i, i + BATCH_SIZE);
+				await this.client.upsert(name, { wait: true, points: batch });
+				for (const p of batch) {
+					insertedIds.push(p.id);
+				}
+			}
+
+			logger.info('Upserted chunks', { collection: name, count: insertedIds.length });
+			return { upserted: insertedIds.length };
 		} catch (error) {
+			if (insertedIds.length > 0) {
+				try {
+					await this.client.delete(name, { wait: true, points: insertedIds });
+					logger.warn('Rolled back partial upsert after failure', {
+						collection: name,
+						rolledBack: insertedIds.length,
+					});
+				} catch (rollbackError) {
+					logger.error('Upsert rollback failed; collection may contain orphaned points', {
+						collection: name,
+						rolledBack: 0,
+						expected: insertedIds.length,
+						rollbackError: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+					});
+				}
+			}
 			if (error instanceof RagSdkError) throw error;
 			throw wrapError(error, RagErrorCode.VECTOR_UPSERT_FAILED, `Failed to upsert chunks into "${name}": ${error}`);
 		}

@@ -405,6 +405,13 @@ describe('IngestService', () => {
 			await expect(service.text('Hello', { documentId: '' })).rejects.toThrow('non-empty');
 		});
 
+		it('rejects whitespace-only documentId', async () => {
+			const mocks = makeMocks();
+			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
+
+			await expect(service.text('Hello', { documentId: '   \t \n ' })).rejects.toThrow('non-whitespace');
+		});
+
 		it('rejects documentId over 256 chars', async () => {
 			const mocks = makeMocks();
 			const service = new IngestService(makeConfig(), mocks.ocr, mocks.embeddings, mocks.vector, mocks.telemetry);
@@ -458,6 +465,84 @@ describe('IngestService', () => {
 
 			await expect(service.text('Hello')).rejects.toThrow(/Embedding dimension mismatch.*1024.*3/);
 			// Must not reach the upsert stage
+			expect(mocks.vector.upsertChunks).not.toHaveBeenCalled();
+		});
+
+		it('catches a dimension mismatch on any chunk, not only the first', async () => {
+			const { chunkDocument } = await import('../chunking/chunker.js');
+			const chunkDocumentMock = vi.mocked(chunkDocument);
+			const twoChunkResult = {
+				documentId: 'doc_mock-id',
+				chunks: [
+					{
+						chunkId: 'chk_1',
+						documentId: 'doc_mock-id',
+						content: 'Page content A',
+						tokenCount: 3,
+						metadata: {
+							documentId: 'doc_mock-id',
+							chunkId: 'chk_1',
+							chunkIndex: 0,
+							sourceName: 'test.pdf',
+							pageStart: 0,
+							pageEnd: 0,
+							processingMode: 'hybrid',
+							embeddingVersion: 'openai:text-embedding-3-small',
+							ocrProvider: 'mistral',
+							createdAt: '2026-01-01T00:00:00.000Z',
+						},
+					},
+					{
+						chunkId: 'chk_2',
+						documentId: 'doc_mock-id',
+						content: 'Page content B',
+						tokenCount: 3,
+						metadata: {
+							documentId: 'doc_mock-id',
+							chunkId: 'chk_2',
+							chunkIndex: 1,
+							sourceName: 'test.pdf',
+							pageStart: 0,
+							pageEnd: 0,
+							processingMode: 'hybrid',
+							embeddingVersion: 'openai:text-embedding-3-small',
+							ocrProvider: 'mistral',
+							createdAt: '2026-01-01T00:00:00.000Z',
+						},
+					},
+				],
+				totalChunks: 2,
+				totalTokens: 6,
+				averageTokensPerChunk: 3,
+			};
+			chunkDocumentMock.mockReturnValueOnce(twoChunkResult);
+
+			const mocks = makeMocks();
+			mocks.embeddings.embedChunks = vi.fn(async (chunks: unknown[]) =>
+				(chunks as Record<string, unknown>[]).map((c, i) => ({
+					...c,
+					embedding: i === 0 ? [0.1, 0.2, 0.3] : [0.1, 0.2],
+				})),
+			) as unknown as EmbeddingService['embedChunks'];
+
+			const service = new IngestService(
+				makeConfig({
+					embeddings: {
+						provider: 'openai',
+						model: 'text-embedding-3-small',
+						apiKey: 'test-key',
+						distanceMetric: 'cosine',
+						versionLabel: 'openai:text-embedding-3-small',
+						vectorSize: 3,
+					},
+				}),
+				mocks.ocr,
+				mocks.embeddings,
+				mocks.vector,
+				mocks.telemetry,
+			);
+
+			await expect(service.text('Hello')).rejects.toThrow(/Embedding dimension mismatch on chunk 1/);
 			expect(mocks.vector.upsertChunks).not.toHaveBeenCalled();
 		});
 

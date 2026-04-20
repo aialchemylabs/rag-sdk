@@ -192,27 +192,35 @@ export class IngestService {
 			// OpenAI v6 base64/float decoding bug against LiteLLM backends). Fail loud
 			// BEFORE seeding Qdrant with garbage vectors.
 			const configuredVectorSize = this.config.embeddings.vectorSize;
-			const actualDimensions = embeddedChunks[0]?.embedding?.length;
-			if (configuredVectorSize != null && actualDimensions != null && actualDimensions !== configuredVectorSize) {
-				throw new RagSdkError(
-					RagErrorCode.EMBEDDING_PROVIDER_ERROR,
-					`Embedding dimension mismatch: embeddings.vectorSize is configured as ${configuredVectorSize} but the provider returned vectors of length ${actualDimensions}. ` +
-						'This usually indicates a provider misconfiguration or a corrupted response from the embedding backend. ' +
-						`Verify the model, base URL, and encoding_format settings for provider '${this.config.embeddings.provider}'.`,
-					{
-						provider: this.config.embeddings.provider,
-						retryable: false,
-					},
-				);
-			}
-			if (configuredVectorSize == null && actualDimensions != null) {
-				// Fallback path — dimensions inferred from the first embedding. This is
-				// how the SDK used to seed collections. It hides provider corruption, so
-				// we log a warning advising callers to set embeddings.vectorSize.
+			const expectedDimensions = configuredVectorSize ?? embeddedChunks[0]?.embedding?.length;
+			if (configuredVectorSize == null && expectedDimensions != null) {
 				logger.warn(
 					'embeddings.vectorSize is not configured — collection dimension will be inferred from the first embedding. Set embeddings.vectorSize to catch provider corruption early.',
-					{ inferredDimensions: actualDimensions },
+					{ inferredDimensions: expectedDimensions },
 				);
+			}
+			if (expectedDimensions != null) {
+				for (let i = 0; i < embeddedChunks.length; i++) {
+					const embedded = embeddedChunks[i];
+					const dims = embedded?.embedding?.length;
+					if (dims == null) {
+						throw new RagSdkError(
+							RagErrorCode.EMBEDDING_PROVIDER_ERROR,
+							`Embedding missing on chunk ${i} (chunkId="${embedded?.chunkId}"). ` +
+								`Verify the provider '${this.config.embeddings.provider}' returned a vector for every chunk.`,
+							{ provider: this.config.embeddings.provider, retryable: false },
+						);
+					}
+					if (dims !== expectedDimensions) {
+						throw new RagSdkError(
+							RagErrorCode.EMBEDDING_PROVIDER_ERROR,
+							`Embedding dimension mismatch on chunk ${i} (chunkId="${embedded?.chunkId}"): expected ${expectedDimensions} but got ${dims}. ` +
+								'This usually indicates a provider misconfiguration or a corrupted response from the embedding backend. ' +
+								`Verify the model, base URL, and encoding_format settings for provider '${this.config.embeddings.provider}'.`,
+							{ provider: this.config.embeddings.provider, retryable: false },
+						);
+					}
+				}
 			}
 
 			// Step 5: Ensure collection and upsert
@@ -224,11 +232,7 @@ export class IngestService {
 			});
 			let upserted: number;
 			try {
-				await this.vector.ensureCollection(
-					tenantId,
-					configuredVectorSize ?? actualDimensions ?? 1536,
-					this.config.embeddings.distanceMetric,
-				);
+				await this.vector.ensureCollection(tenantId, expectedDimensions ?? 1536, this.config.embeddings.distanceMetric);
 
 				const upsertResult = await this.vector.upsertChunks(embeddedChunks, tenantId);
 				upserted = upsertResult.upserted;
@@ -300,10 +304,10 @@ export class IngestService {
 	}
 
 	private validateExternalDocumentId(documentId: string): void {
-		if (typeof documentId !== 'string' || documentId.length === 0) {
+		if (typeof documentId !== 'string' || documentId.trim().length === 0) {
 			throw new RagSdkError(
 				RagErrorCode.VALIDATION_INVALID_INPUT,
-				'options.documentId must be a non-empty string when provided.',
+				'options.documentId must be a non-empty, non-whitespace string when provided.',
 			);
 		}
 		if (documentId.length > 256) {

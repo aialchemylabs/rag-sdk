@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-04-20
+
+### Fixed
+
+- **Citation text leaks parser/chunker artifacts.** `AnswerResult.citations[].text` no longer contains Markdown table-separator rows (`| --- | --- |`), page-footer lines (`Page | N`), orphaned cell fragments (`| L`), standalone LaTeX math spans, or running-header tokens repeated across pages. Fix lands upstream at the normalize stage so embeddings are computed on cleaned content. ([src/normalize/sanitize.ts](src/normalize/sanitize.ts), [src/normalize/runningHeaders.ts](src/normalize/runningHeaders.ts), [src/normalize/normalizer.ts](src/normalize/normalizer.ts)) — **Note:** consumers must re-ingest from source documents to flush artifact-laden embeddings written by earlier versions.
+- **Chunker splits tables mid-row.** Oversized tables (exceeding `chunking.maxTokens`) now split at row boundaries with the header + separator replicated on every continuation chunk. A new `TABLE_ROW_OVERSIZE` warning on `ChunkingResult.warnings` flags single rows that alone exceed `maxTokens`. ([src/chunking/chunker.ts](src/chunking/chunker.ts), [src/chunking/chunk.types.ts](src/chunking/chunk.types.ts))
+- **Embedding dimension validation was first-chunk-only.** Ingestion now validates every chunk's embedding length against the configured `embeddings.vectorSize`, so a partial batch corruption cannot slip past and seed Qdrant with garbage vectors. ([src/ingest/service.ts](src/ingest/service.ts))
+- **Batched Qdrant upserts could leave partial writes on failure.** `QdrantAdapter.upsertChunks` now tracks inserted point IDs across batches and rolls them back via `client.delete({ points: [...] })` if a later batch fails. If rollback itself fails, the error is logged with the orphaned point count so operators can investigate. ([src/vector/qdrantAdapter.ts](src/vector/qdrantAdapter.ts))
+- **Answer telemetry attributed events to an unresolved tenant.** `AnswerService.answer` now resolves `tenantId` from `options.security.tenantId ?? config.defaults.tenantId`, mirroring `RetrieveService.query` so telemetry is consistently attributed. ([src/answer/service.ts](src/answer/service.ts))
+- **External `documentId` validation permitted whitespace-only IDs.** `IngestOptions.documentId` is now rejected if it trims to empty. ([src/ingest/service.ts](src/ingest/service.ts))
+
+### Added
+
+- `src/answer/excerpt.ts` — shared `buildCitationExcerpt(content, maxChars)` used by both `RetrieveService` and `AnswerService`. Applies a lightweight sanitizer as defense-in-depth for legacy chunk content and truncates at the nearest preceding line break so excerpts never fabricate new mid-row fragments like `| L`.
+
 ## [0.1.2] - 2026-04-14
 
 ### Fixed

@@ -32,6 +32,14 @@ export interface Chunk {
 	embedding?: number[];
 }
 
+export interface ChunkingWarning {
+	code: string;
+	message: string;
+	pageIndex?: number;
+	sectionPath?: string[];
+	details?: Record<string, unknown>;
+}
+
 /** Summary statistics returned after chunking a document. */
 export interface ChunkingResult {
 	documentId: string;
@@ -39,4 +47,5 @@ export interface ChunkingResult {
 	totalChunks: number;
 	totalTokens: number;
 	averageTokensPerChunk: number;
+	warnings?: ChunkingWarning[];
 }

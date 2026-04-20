@@ -8,6 +8,8 @@ import type {
 import type { MistralOcrRawResult } from '../ocr/index.js';
 import { generateId } from '../utils/index.js';
 import { createLogger } from '../telemetry/logger.js';
+import { sanitizeMarkdown } from './sanitize.js';
+import { stripRunningHeadersAndFooters } from './runningHeaders.js';
 
 const logger = createLogger('normalize');
 
@@ -136,25 +138,38 @@ export function normalizeOcrResult(raw: MistralOcrRawResult, options: NormalizeO
 	const allWarnings: OcrWarning[] = [];
 	let totalCharacters = 0;
 
-	const pages: NormalizedPage[] = raw.pages.map((rawPage) => {
-		const markdown = rawPage.markdown;
+	const preliminaryPages: NormalizedPage[] = raw.pages.map((rawPage) => ({
+		pageIndex: rawPage.index,
+		markdown: rawPage.markdown,
+		text: '',
+		characterCount: 0,
+		hasImages: false,
+		hasTablesOnPage: false,
+		warnings: [],
+	}));
+
+	const headerStripped = stripRunningHeadersAndFooters(preliminaryPages);
+
+	const pages: NormalizedPage[] = headerStripped.map((stripped) => {
+		const rawMarkdown = stripped.markdown;
+		const markdown = sanitizeMarkdown(rawMarkdown);
 		const text = stripMarkdown(markdown);
 		const characterCount = text.length;
 		totalCharacters += characterCount;
 
-		const pageTables = extractTablesFromMarkdown(markdown, rawPage.index, allTables.length);
+		const pageTables = extractTablesFromMarkdown(rawMarkdown, stripped.pageIndex, allTables.length);
 		allTables.push(...pageTables);
 
-		const pageLinks = extractLinksFromMarkdown(markdown, rawPage.index);
+		const pageLinks = extractLinksFromMarkdown(rawMarkdown, stripped.pageIndex);
 		allLinks.push(...pageLinks);
 
-		const pageWarnings = detectPageWarnings(markdown, rawPage.index);
+		const pageWarnings = detectPageWarnings(markdown, stripped.pageIndex);
 		allWarnings.push(...pageWarnings);
 
-		const pageHasImages = hasImages(markdown);
+		const pageHasImages = hasImages(rawMarkdown);
 
 		return {
-			pageIndex: rawPage.index,
+			pageIndex: stripped.pageIndex,
 			markdown,
 			text,
 			characterCount,

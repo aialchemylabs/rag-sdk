@@ -178,4 +178,19 @@ describe('AnswerService citation validation', () => {
 		expect(result.riskLevel).toBe('low_evidence');
 		expect(result.disclaimer).toContain('[99]');
 	});
+
+	it('resolves tenantId from config.defaults in telemetry events when no per-call override', async () => {
+		const { service, telemetry } = createService(['The SDK handles retrieval [1].'], 'refuse');
+
+		await service.answer('How does the SDK work?');
+
+		const emit = vi.mocked(telemetry.emit);
+		const startEvent = emit.mock.calls.find(([event]) => event === 'answer_generation_started');
+		expect(startEvent).toBeDefined();
+		expect((startEvent?.[1] as { tenantId?: string } | undefined)?.tenantId).toBe('tenant-a');
+
+		const executedEvent = emit.mock.calls.find(([event]) => event === 'answer_generation_executed');
+		expect(executedEvent).toBeDefined();
+		expect((executedEvent?.[1] as { tenantId?: string } | undefined)?.tenantId).toBe('tenant-a');
+	});
 });

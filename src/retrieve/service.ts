@@ -1,3 +1,4 @@
+import { buildCitationExcerpt } from '../answer/excerpt.js';
 import type { ValidatedConfig } from '../config/validate.js';
 import type { EmbeddingService } from '../embeddings/service.js';
 import { RagErrorCode } from '../errors/errorCodes.js';
@@ -163,7 +164,7 @@ export class RetrieveService {
 			chunkId: payload.chunkId as string,
 			pageStart: payload.pageStart as number,
 			pageEnd: payload.pageEnd as number,
-			excerpt: (payload.content as string)?.substring(0, 200),
+			excerpt: buildCitationExcerpt((payload.content as string) ?? '', 200),
 		};
 
 		return {

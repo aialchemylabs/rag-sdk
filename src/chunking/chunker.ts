@@ -1,6 +1,6 @@
 import { generateId, estimateTokens } from '../utils/index.js';
 import type { NormalizedDocument } from '../normalize/document.types.js';
-import type { Chunk, ChunkMetadata, ChunkingResult } from './chunk.types.js';
+import type { Chunk, ChunkMetadata, ChunkingResult, ChunkingWarning } from './chunk.types.js';
 import { type Block, parseBlocks } from './blockParser.js';
 import { extractOverlap } from './overlap.js';
 
@@ -29,6 +29,7 @@ interface PendingChunk {
 	pageStart: number;
 	pageEnd: number;
 	sectionPath: string[];
+	skipOverlap?: boolean;
 }
 
 function isHardBoundary(block: Block, config: ChunkerConfig): boolean {
@@ -87,7 +88,7 @@ function flushPending(
 	if (pending.blocks.length === 0) return previousContent;
 
 	const rawContent = buildContent(pending.blocks);
-	const overlap = extractOverlap(previousContent, config.overlapTokens);
+	const overlap = pending.skipOverlap ? '' : extractOverlap(previousContent, config.overlapTokens);
 	const content = overlap ? `${overlap}\n\n${rawContent}` : rawContent;
 	const tokenCount = estimateTokens(content);
 
@@ -126,14 +127,120 @@ function flushPending(
 	return rawContent;
 }
 
+function splitOversizedTable(block: Block, config: ChunkerConfig, warnings: ChunkingWarning[]): Block[] {
+	if (block.tokenEstimate <= config.maxTokens) {
+		return [block];
+	}
+
+	const lines = block.markdown.split('\n').map((l) => l.trimEnd());
+	if (lines.length < 3) {
+		return [block];
+	}
+
+	const header = lines[0] as string;
+	const separator = lines[1] as string;
+	const headerPrefix = `${header}\n${separator}`;
+	const headerTokens = estimateTokens(headerPrefix);
+	const dataRows = lines.slice(2).filter((l) => l.length > 0);
+
+	const pieces: Block[] = [];
+	let currentRows: string[] = [];
+	let currentTokens = headerTokens;
+	let pieceIndex = 0;
+
+	const emitPiece = () => {
+		if (currentRows.length === 0) return;
+		const markdown = `${headerPrefix}\n${currentRows.join('\n')}`;
+		pieces.push({
+			blockIndex: block.blockIndex + pieceIndex,
+			type: 'table',
+			content: markdown,
+			markdown,
+			tokenEstimate: estimateTokens(markdown),
+			pageIndex: block.pageIndex,
+			sectionPath: [...block.sectionPath],
+			isBoundary: true,
+		});
+		pieceIndex++;
+		currentRows = [];
+		currentTokens = headerTokens;
+	};
+
+	for (const row of dataRows) {
+		const rowTokens = estimateTokens(row);
+		const rowAlonePlusHeaderTokens = headerTokens + rowTokens;
+
+		// Single-row oversize: cannot split further without breaking row atomicity.
+		if (rowAlonePlusHeaderTokens > config.maxTokens) {
+			emitPiece();
+			const markdown = `${headerPrefix}\n${row}`;
+			warnings.push({
+				code: 'TABLE_ROW_OVERSIZE',
+				message: `Table row exceeds maxTokens (${estimateTokens(markdown)} > ${config.maxTokens}); emitted as single oversize chunk to preserve row atomicity.`,
+				pageIndex: block.pageIndex,
+				sectionPath: [...block.sectionPath],
+				details: {
+					rowTokens: estimateTokens(markdown),
+					maxTokens: config.maxTokens,
+				},
+			});
+			pieces.push({
+				blockIndex: block.blockIndex + pieceIndex,
+				type: 'table',
+				content: markdown,
+				markdown,
+				tokenEstimate: estimateTokens(markdown),
+				pageIndex: block.pageIndex,
+				sectionPath: [...block.sectionPath],
+				isBoundary: true,
+			});
+			pieceIndex++;
+			continue;
+		}
+
+		if (currentTokens + rowTokens > config.maxTokens && currentRows.length > 0) {
+			emitPiece();
+		}
+
+		currentRows.push(row);
+		currentTokens += rowTokens;
+	}
+
+	emitPiece();
+
+	if (pieces.length === 0) {
+		return [block];
+	}
+
+	return pieces;
+}
+
 export function chunkDocument(
 	document: NormalizedDocument,
 	config: ChunkerConfig,
 	context: ChunkingContext,
 ): ChunkingResult {
-	const allBlocks: Block[] = [];
+	const warnings: ChunkingWarning[] = [];
+	const rawBlocks: Block[] = [];
 	for (const page of document.pages) {
-		allBlocks.push(...parseBlocks(page));
+		rawBlocks.push(...parseBlocks(page));
+	}
+
+	const allBlocks: Block[] = [];
+	const tableContinuationBlocks = new Set<Block>();
+	for (const block of rawBlocks) {
+		if (block.type === 'table') {
+			const pieces = splitOversizedTable(block, config, warnings);
+			for (let i = 0; i < pieces.length; i++) {
+				const piece = pieces[i] as Block;
+				if (i > 0) {
+					tableContinuationBlocks.add(piece);
+				}
+				allBlocks.push(piece);
+			}
+		} else {
+			allBlocks.push(block);
+		}
 	}
 
 	const chunks: Chunk[] = [];
@@ -145,6 +252,9 @@ export function chunkDocument(
 
 		if (pending === null) {
 			pending = createEmptyPending(block);
+			if (tableContinuationBlocks.has(block)) {
+				pending.skipOverlap = true;
+			}
 		}
 
 		const isPageChange = pending.blocks.length > 0 && block.pageIndex !== pending.pageEnd;
@@ -155,6 +265,9 @@ export function chunkDocument(
 		if (forceBoundary || forcePageBreak || wouldExceedMax) {
 			previousContent = flushPending(pending, chunks, previousContent, document, config, context);
 			pending = createEmptyPending(block);
+			if (tableContinuationBlocks.has(block)) {
+				pending.skipOverlap = true;
+			}
 		}
 
 		pending.blocks.push(block);
@@ -183,11 +296,15 @@ export function chunkDocument(
 
 	const totalTokens = chunks.reduce((sum, c) => sum + c.tokenCount, 0);
 
-	return {
+	const result: ChunkingResult = {
 		documentId: document.documentId,
 		chunks,
 		totalChunks: chunks.length,
 		totalTokens,
 		averageTokensPerChunk: chunks.length > 0 ? Math.round(totalTokens / chunks.length) : 0,
 	};
+	if (warnings.length > 0) {
+		result.warnings = warnings;
+	}
+	return result;
 }
