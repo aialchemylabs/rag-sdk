@@ -1,16 +1,20 @@
 import type { ValidatedConfig } from '../config/validate.js';
 import { RagErrorCode } from '../errors/errorCodes.js';
 import { RagSdkError } from '../errors/ragError.js';
-import type { ChatProvider } from '../llmProviders/llmProvider.types.js';
+import type { ChatProvider, ChatResponse } from '../llmProviders/llmProvider.types.js';
 import type { RetrieveService } from '../retrieve/service.js';
 import type { TelemetryEmitter } from '../telemetry/emitter.js';
-import type { AnswerCitation, AnswerOptions, AnswerResult } from './answer.types.js';
+import type { AnswerCitation, AnswerOptions, AnswerResult, AnswerUsage } from './answer.types.js';
 import { buildCitationExcerpt } from './excerpt.js';
 import type { RetrieveMatch } from '../retrieve/retrieve.types.js';
 
 interface CitationValidation {
 	validReferencedIndices: Set<number>;
 	invalidReferencedIndices: Set<number>;
+}
+
+function emptyUsage(): AnswerUsage {
+	return { promptTokens: 0, completionTokens: 0, totalTokens: 0, estimated: false };
 }
 
 export class AnswerService {
@@ -32,13 +36,15 @@ export class AnswerService {
 			);
 		}
 
+		const modelId = answeringConfig.model;
 		const noCitationPolicy = options?.noCitationPolicy ?? answeringConfig.noCitationPolicy;
 		const telemetry = this.telemetry.withOverride(options?.telemetry?.onEvent);
 		const tenantId = options?.security?.tenantId ?? this.config.defaults.tenantId;
+		const usage: AnswerUsage = emptyUsage();
 
 		telemetry.emit('answer_generation_started', {
 			tenantId,
-			metadata: { query: query.substring(0, 100), noCitationPolicy },
+			metadata: { query: query.substring(0, 100), noCitationPolicy, modelId },
 		});
 
 		try {
@@ -56,7 +62,14 @@ export class AnswerService {
 
 			// Step 2: Check if we have sufficient evidence
 			if (retrievalResult.matches.length === 0) {
-				const noEvidenceResult = this.handleNoEvidence(query, noCitationPolicy, retrievalTimeMs, startTime);
+				const noEvidenceResult = this.handleNoEvidence(
+					query,
+					noCitationPolicy,
+					retrievalTimeMs,
+					startTime,
+					modelId,
+					usage,
+				);
 				telemetry.emit('answer_generation_executed', {
 					durationMs: noEvidenceResult.totalTimeMs,
 					tenantId,
@@ -65,6 +78,8 @@ export class AnswerService {
 						matchCount: 0,
 						riskLevel: noEvidenceResult.riskLevel,
 						outcome: 'no_evidence',
+						modelId,
+						totalTokens: usage.totalTokens,
 					},
 				});
 				return noEvidenceResult;
@@ -79,13 +94,15 @@ export class AnswerService {
 				temperature: options?.temperature ?? answeringConfig.temperature,
 			};
 
+			const userPrompt = `Context:\n${context}\n\nQuestion: ${query}`;
 			let response = await this.answerProvider.generateChatCompletion(
 				[
 					{ role: 'system', content: systemPrompt },
-					{ role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
+					{ role: 'user', content: userPrompt },
 				],
 				chatOptions,
 			);
+			this.accumulateUsage(usage, response, systemPrompt, userPrompt);
 
 			let generationTimeMs = Date.now() - generationStartTime;
 
@@ -99,25 +116,22 @@ export class AnswerService {
 			while (this.shouldRepairCitations(citationValidation) && repairAttempts < MAX_CITATION_REPAIR_ATTEMPTS) {
 				repairAttempts++;
 				const repairStartTime = Date.now();
+				const repairSystem = this.buildCitationRepairPrompt(systemPrompt, retrievalResult.matches.length);
+				const repairUser = this.buildCitationRepairRequest(
+					context,
+					query,
+					response.content,
+					citationValidation,
+					retrievalResult.matches.length,
+				);
 				response = await this.answerProvider.generateChatCompletion(
 					[
-						{
-							role: 'system',
-							content: this.buildCitationRepairPrompt(systemPrompt, retrievalResult.matches.length),
-						},
-						{
-							role: 'user',
-							content: this.buildCitationRepairRequest(
-								context,
-								query,
-								response.content,
-								citationValidation,
-								retrievalResult.matches.length,
-							),
-						},
+						{ role: 'system', content: repairSystem },
+						{ role: 'user', content: repairUser },
 					],
 					chatOptions,
 				);
+				this.accumulateUsage(usage, response, repairSystem, repairUser);
 				generationTimeMs += Date.now() - repairStartTime;
 				citationValidation = this.validateCitationIndices(response.content, retrievalResult.matches.length);
 			}
@@ -130,6 +144,8 @@ export class AnswerService {
 					generationTimeMs,
 					startTime,
 					invalidReferencedIndices,
+					modelId,
+					usage,
 				);
 				telemetry.emit('answer_generation_executed', {
 					durationMs: violationResult.totalTimeMs,
@@ -140,6 +156,8 @@ export class AnswerService {
 						riskLevel: violationResult.riskLevel,
 						outcome: 'citation_violation',
 						invalidMarkers: [...invalidReferencedIndices],
+						modelId,
+						totalTokens: usage.totalTokens,
 					},
 				});
 				return violationResult;
@@ -165,6 +183,8 @@ export class AnswerService {
 					citedSourceCount: validReferencedIndices.size,
 					confidence,
 					riskLevel,
+					modelId,
+					totalTokens: usage.totalTokens,
 				},
 			});
 
@@ -184,25 +204,54 @@ export class AnswerService {
 				retrievalTimeMs,
 				generationTimeMs,
 				totalTimeMs,
+				modelId,
+				usage,
 			};
 		} catch (err) {
 			telemetry.emit('answer_generation_failed', {
 				durationMs: Date.now() - startTime,
 				tenantId,
 				error: err instanceof Error ? err.message : String(err),
-				metadata: { query: query.substring(0, 100) },
+				metadata: { query: query.substring(0, 100), modelId, totalTokens: usage.totalTokens },
 			});
 			if (err instanceof RagSdkError) throw err;
 			throw new RagSdkError(
 				RagErrorCode.ANSWER_PROVIDER_ERROR,
 				`Answer generation failed: ${err instanceof Error ? err.message : String(err)}`,
-				{ retryable: true, cause: err instanceof Error ? err : undefined },
+				{
+					retryable: true,
+					cause: err instanceof Error ? err : undefined,
+					details: { modelId, usage: { ...usage } },
+				},
 			);
 		}
 	}
 
-	private handleNoEvidence(_query: string, policy: string, retrievalTimeMs: number, startTime: number): AnswerResult {
+	private accumulateUsage(acc: AnswerUsage, response: ChatResponse, systemPrompt: string, userPrompt: string): void {
+		if (response.usage) {
+			acc.promptTokens += response.usage.promptTokens;
+			acc.completionTokens += response.usage.completionTokens;
+			acc.totalTokens += response.usage.totalTokens;
+			return;
+		}
+		const promptTokens = this.answerProvider.getTokenCount(`${systemPrompt}\n${userPrompt}`);
+		const completionTokens = this.answerProvider.getTokenCount(response.content);
+		acc.promptTokens += promptTokens;
+		acc.completionTokens += completionTokens;
+		acc.totalTokens += promptTokens + completionTokens;
+		acc.estimated = true;
+	}
+
+	private handleNoEvidence(
+		_query: string,
+		policy: string,
+		retrievalTimeMs: number,
+		startTime: number,
+		modelId: string,
+		usage: AnswerUsage,
+	): AnswerResult {
 		const totalTimeMs = Date.now() - startTime;
+		const usageSnapshot: AnswerUsage = { ...usage };
 
 		if (policy === 'refuse') {
 			return {
@@ -215,6 +264,8 @@ export class AnswerService {
 				retrievalTimeMs,
 				generationTimeMs: 0,
 				totalTimeMs,
+				modelId,
+				usage: usageSnapshot,
 			};
 		}
 
@@ -229,6 +280,8 @@ export class AnswerService {
 				retrievalTimeMs,
 				generationTimeMs: 0,
 				totalTimeMs,
+				modelId,
+				usage: usageSnapshot,
 			};
 		}
 
@@ -242,6 +295,8 @@ export class AnswerService {
 			retrievalTimeMs,
 			generationTimeMs: 0,
 			totalTimeMs,
+			modelId,
+			usage: usageSnapshot,
 		};
 	}
 
@@ -251,6 +306,8 @@ export class AnswerService {
 		generationTimeMs: number,
 		startTime: number,
 		invalidReferencedIndices: Set<number>,
+		modelId: string,
+		usage: AnswerUsage,
 	): AnswerResult {
 		const totalTimeMs = Date.now() - startTime;
 		const invalidMarkers = [...invalidReferencedIndices].sort((a, b) => a - b);
@@ -273,6 +330,8 @@ export class AnswerService {
 			retrievalTimeMs,
 			generationTimeMs,
 			totalTimeMs,
+			modelId,
+			usage: { ...usage },
 		};
 	}
 

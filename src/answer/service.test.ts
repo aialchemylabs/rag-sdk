@@ -194,3 +194,173 @@ describe('AnswerService citation validation', () => {
 		expect((executedEvent?.[1] as { tenantId?: string } | undefined)?.tenantId).toBe('tenant-a');
 	});
 });
+
+interface UsageResponseSpec {
+	content: string;
+	usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+}
+
+function createServiceWithUsage(
+	responses: UsageResponseSpec[],
+	noCitationPolicy: 'warn' | 'refuse' | 'allow' = 'refuse',
+	options?: { tokenCount?: (text: string) => number; emptyMatches?: boolean },
+) {
+	const queue = [...responses];
+	const provider: ChatProvider = {
+		generateChatCompletion: vi.fn(async () => {
+			const next = queue.shift() ?? { content: '' };
+			return {
+				content: next.content,
+				finishReason: 'stop',
+				...(next.usage !== undefined && { usage: next.usage }),
+			};
+		}),
+		getTokenCount: vi.fn(options?.tokenCount ?? (() => 0)),
+	};
+
+	const retriever = {
+		query: vi.fn(async () =>
+			options?.emptyMatches
+				? { query: 'q', matches: [], totalMatches: 0, searchTimeMs: 1, searchType: 'dense' as const }
+				: makeRetrievalResult(),
+		),
+	} as unknown as RetrieveService;
+
+	const telemetry = {
+		emit: vi.fn(),
+		metric: vi.fn(),
+		trackDuration: vi.fn(),
+		withOverride: vi.fn(function (this: unknown) {
+			return this as TelemetryEmitter;
+		}),
+	} as unknown as TelemetryEmitter;
+
+	return {
+		service: new AnswerService(makeValidatedConfig(noCitationPolicy), provider, retriever, telemetry),
+		provider,
+		retriever,
+		telemetry,
+	};
+}
+
+describe('AnswerService usage + modelId', () => {
+	it('populates usage from provider response on happy path', async () => {
+		const { service } = createServiceWithUsage([
+			{
+				content: 'The SDK handles retrieval [1].',
+				usage: { promptTokens: 80, completionTokens: 20, totalTokens: 100 },
+			},
+		]);
+
+		const result = await service.answer('How does the SDK work?');
+
+		expect(result.modelId).toBe('gpt-4o');
+		expect(result.usage).toEqual({
+			promptTokens: 80,
+			completionTokens: 20,
+			totalTokens: 100,
+			estimated: false,
+		});
+	});
+
+	it('returns zero usage with estimated=false on no-evidence refusal', async () => {
+		const { service } = createServiceWithUsage([], 'refuse', { emptyMatches: true });
+
+		const result = await service.answer('Unknown question');
+
+		expect(result.riskLevel).toBe('no_evidence');
+		expect(result.modelId).toBe('gpt-4o');
+		expect(result.usage).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0, estimated: false });
+	});
+
+	it('carries usage through on citation-violation refusal', async () => {
+		const bad = 'The SDK [99] handles retrieval [42].';
+		const { service } = createServiceWithUsage(
+			[
+				{ content: bad, usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+				{ content: bad, usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+				{ content: bad, usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+			],
+			'refuse',
+		);
+
+		const result = await service.answer('How?');
+
+		expect(result.riskLevel).toBe('low_evidence');
+		expect(result.modelId).toBe('gpt-4o');
+		expect(result.usage).toEqual({
+			promptTokens: 30,
+			completionTokens: 15,
+			totalTokens: 45,
+			estimated: false,
+		});
+	});
+
+	it('accumulates usage across citation-repair retries', async () => {
+		const { service } = createServiceWithUsage([
+			{
+				content: 'Cites [99].',
+				usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+			},
+			{
+				content: 'Cites [1].',
+				usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+			},
+		]);
+
+		const result = await service.answer('How?');
+
+		expect(result.usage).toEqual({
+			promptTokens: 20,
+			completionTokens: 10,
+			totalTokens: 30,
+			estimated: false,
+		});
+	});
+
+	it('falls back to getTokenCount with estimated=true when provider omits usage', async () => {
+		const tokenCount = vi.fn((text: string) => (text.length > 50 ? 42 : 7));
+		const { service } = createServiceWithUsage([{ content: 'Cites [1].' }], 'refuse', { tokenCount });
+
+		const result = await service.answer('How?');
+
+		expect(result.usage.estimated).toBe(true);
+		expect(result.usage.promptTokens).toBe(42);
+		expect(result.usage.completionTokens).toBe(7);
+		expect(result.usage.totalTokens).toBe(49);
+	});
+
+	it('marks usage estimated when any call in the pipeline omits usage (mixed)', async () => {
+		const tokenCount = vi.fn(() => 5);
+		const { service } = createServiceWithUsage(
+			[
+				{ content: 'Cites [99].', usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } },
+				{ content: 'Cites [1].' },
+			],
+			'refuse',
+			{ tokenCount },
+		);
+
+		const result = await service.answer('How?');
+
+		expect(result.usage.estimated).toBe(true);
+		expect(result.usage.totalTokens).toBe(25);
+	});
+
+	it('emits modelId and totalTokens on answer_generation_executed telemetry', async () => {
+		const { service, telemetry } = createServiceWithUsage([
+			{
+				content: 'The SDK handles retrieval [1].',
+				usage: { promptTokens: 80, completionTokens: 20, totalTokens: 100 },
+			},
+		]);
+
+		await service.answer('How?');
+
+		const emit = vi.mocked(telemetry.emit);
+		const executedEvent = emit.mock.calls.find(([event]) => event === 'answer_generation_executed');
+		const metadata = (executedEvent?.[1] as { metadata?: Record<string, unknown> })?.metadata ?? {};
+		expect(metadata.modelId).toBe('gpt-4o');
+		expect(metadata.totalTokens).toBe(100);
+	});
+});

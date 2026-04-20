@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-04-20
+
+### Added
+
+- **`AnswerResult.modelId` and `AnswerResult.usage`.** Every call to `AnswerService.answer` now returns the answering `modelId` and a token-usage breakdown `{ promptTokens, completionTokens, totalTokens, estimated }`. `modelId` is always populated from `config.answering.model`. `usage` is always present — zero-valued on refusal paths where no LLM call was made, and flagged `estimated: true` when the provider omits native usage and the SDK falls back to `ChatProvider.getTokenCount`. Tokens accumulate across citation-repair retries. Purely additive; existing `retrievalTimeMs` / `generationTimeMs` / `totalTimeMs` fields are unchanged. ([src/answer/answer.types.ts](src/answer/answer.types.ts), [src/answer/service.ts](src/answer/service.ts))
+- **Telemetry carries `modelId` and `totalTokens`.** `answer_generation_started.metadata` surfaces `modelId`; `answer_generation_executed.metadata` and `answer_generation_failed.metadata` surface both `modelId` and `totalTokens` so ops dashboards can roll up token spend without parsing return values.
+- **`RagSdkError.details.usage` on `ANSWER_PROVIDER_ERROR`.** When an LLM call fails mid-pipeline (e.g. after a successful initial generation but during citation repair), the error now carries any tokens already spent via `details.modelId` and `details.usage` so callers handling failure paths can still bill accurately.
+
 ## [0.1.3] - 2026-04-20
 
 ### Fixed
